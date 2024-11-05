@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+#
+# porkbun-api - API for Porkbun Registar/DNS
+#
+#    Copyright (C) 2024 Rodrigo Silva (MestreLion) <linux@rodrigosilva.com>
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program. See <http://www.gnu.org/licenses/gpl.html>
+#
+# Similar projects:
+# https://github.com/gechandesu/piglet	great cli, bash completion, README, Makefile
+#------------------------------------------------------------------------------
+set -Eeuo pipefail  # Exit on most errors.
+trap '>&2 echo "error: line $LINENO, status $?: $BASH_COMMAND"' ERR
+
+# Default values ---------------------------------------------------------------
+
+# May be unset in systemd units, so setting here
+USER=${USER:-$(id -un)}
+HOME=${HOME:-$(getent passwd "$USER" | cut -d: -f6)}
+
+# Internal
+slug=porkbun-api
+self=${0##*/}
+here=$(dirname "$(readlink -f "$0")")
+
+if (( EUID == 0 )); then  # EUID set by bash. POSIX: [ "$(id -u)" -eq 0 ]
+	confdir=/etc/$slug
+	logfile=/var/log/$slug.log
+else
+	confdir=${XDG_CONFIG_HOME:-${HOME}/.config}/$slug
+	logfile=${XDG_STATE_HOME:-${HOME}/.local/state}/$slug.log
+fi
+
+# Command-line options
+config=${PBAPI_CONFIG:-${confdir}/${slug}.conf}
+cmd=
+cmdset=0
+verbose=0
+# acme_path_suffix=
+# logfile is also a config file option, so it is handled in read_env()
+
+# Factory default options for config file and env vars
+# Defined in a re-usable function, called after config file is read
+#  so env vars can take precedence.
+read_env() {
+	# API settings
+	PBAPI_HOST=${PBAPI_HOST:-"https://api.porkbun.com"}
+	PBAPI_ROOT=${PBAPI_ROOT:-"/api/json/v3"}
+
+	# Authentication and account
+	PBAPI_KEY=${PBAPI_KEY:-}
+	PBAPI_SECRET=${PBAPI_SECRET:-}
+	local domain=${PBAPI_ROOT_DOMAIN:-}
+	PBAPI_ROOT_DOMAIN=${domain%/}
+
+	# DynDNS
+	PBAPI_DYNDNS_IP_TYPE=${PBAPI_DYNDNS_IP_TYPE:-both}
+	PBAPI_DYNDNS_IPV4_PROVIDER=${PBAPI_DYNDNS_IPV4_PROVIDER:-}
+	PBAPI_DYNDNS_IPV6_PROVIDER=${PBAPI_DYNDNS_IPV6_PROVIDER:-}
+	PBAPI_DYNDNS_SUBDOMAIN=${PBAPI_DYNDNS_SUBDOMAIN:-@}
+
+	# SSL download
+	PBAPI_SSL_CERTIFICATE_PATH=${PBAPI_SSL_CERTIFICATE_PATH:-${confdir}/@DOMAIN@.pem}
+	PBAPI_SSL_PRIVATE_KEY_PATH=${PBAPI_SSL_PRIVATE_KEY_PATH:-${confdir}/@DOMAIN@.key}
+
+	# Others
+	PBAPI_TTL=${PBAPI_TTL:-600}
+	logfile=${PBAPI_LOG:-$logfile}
+}
+
+create_config() {
+	# shellcheck disable=SC2174
+	mkdir --parents --mode=0700 -- "$(dirname "$1")"
+	cat > "$1" <<-EOF
+	# Porkbun DNS API configuration file.
+	# https://github.com/MestreLion/porkbun-api
+	#
+	# Some values may be overwritten by environment variables or
+	# command-line arguments.
+	#
+	# This file will be sourced by bash, keep a valid syntax!
+
+	# ----------------------------------------------------------------------
+	# API Authentication and account
+
+	# Porkbun API account credentials.
+	# https://porkbun.com/account/api
+	PBAPI_KEY=
+	PBAPI_SECRET=
+
+	# Account root domain. Do not include any subdomains or wildcards.
+	PBAPI_ROOT_DOMAIN=
+
+	# ----------------------------------------------------------------------
+	# Dynamic DNS (DDNS)
+
+	# Setup Dynamic DNS for 'ipv6', 'ipv4' or 'both' (default)
+	#PBAPI_DYNDNS_IP_TYPE=$PBAPI_DYNDNS_IP_TYPE
+
+	# Sources for obtaining external IPv4 and global IPv6/128.
+	# Fill in with the address of a web service that replies the IP
+	# as text, such as the example below, and it will be "curl-ed"
+	# to obtain the IP. Some services are (some may be down or be very slow):
+	# https://ipv6.wtfismyip.com/text  https://ipv4.wtfismyip.com/text
+	# https://ip6.seeip.org            https://ip4.seeip.org'
+	# https://api6.ipify.org           https://api.ipify.org
+	# https://ipv6.icanhazip.com       https://ipv4.icanhazip.com
+	# Leave commented or blank for the internal provider: It uses the
+	# 'ip' local command for IPv6 and Porkbun's 'ping' API for IPv4.
+	#PBAPI_DYNDNS_IPV4_PROVIDER='https://ipv4.icanhazip.com'
+	#PBAPI_DYNDNS_IPV6_PROVIDER='https://ipv6.icanhazip.com'
+
+	# Subdomain for Dynamic DNS. Default is '@', meaning the root domain.
+	# Uncomment and change to setup at a subdomain instead. Use just a
+	# single word, do not include the root domain.
+	#PBAPI_DYNDNS_SUBDOMAIN=$PBAPI_DYNDNS_SUBDOMAIN
+
+	# Log file path. If blank, the default is different for root and users:
+	# Prefix for root is '/var', for users is usually ~/.local/state
+	# Run '$slug --help' as the intended user to see the effective default
+	#PBAPI_LOG=$logfile
+
+	# ----------------------------------------------------------------------
+	# SSL Certificate Download
+
+	# Path to download the SSL certificate
+	# If blank, the default is different for root and users:
+	# Prefix for root is '/etc', for users is usually ~/.config
+	# Run '$slug --help' as the intended user to see the effective default
+	# The string '@DOMAIN@' is replaced with the effective PBAPI_ROOT_DOMAIN
+	#PBAPI_SSL_CERTIFICATE_PATH=$(escape "$PBAPI_SSL_CERTIFICATE_PATH")
+
+	# Path to download the SSL private key
+	# See notes on PBAPI_SSL_CERTIFICATE_PATH above
+	#PBAPI_SSL_PRIVATE_KEY_PATH=$(escape "$PBAPI_SSL_PRIVATE_KEY_PATH")
+
+	# ----------------------------------------------------------------------
+	# General settings and preferences
+
+	# Porbun API host, by default $PBAPI_HOST
+	# Uncomment to use the IPv4-only host or an alternate host.
+	#PBAPI_HOST=https://api-ipv4.porkbun.com
+
+	# Porbun API root, currently $PBAPI_ROOT
+	# With PBAPI_HOST it forms the root endpoint of all API calls
+	# Uncomment to hardcode an alternate (or updated) root
+	#PBAPI_ROOT=$PBAPI_ROOT
+
+	# Default Time-To-Live, in seconds, for DNS entries created or modified.
+	# Porkbun's default is 600 (5 minutes).
+	#PBAPI_TTL=600
+	EOF
+	chmod 0600 -- "$1"
+	message "Config file created: ${config}"
+	message "In case of errors, edit it and try again."
+}
+
+usage() {
+	if [[ "${1:-}" ]] ; then exec >&2; fi
+	cat <<-USAGE
+	Usage:
+	  porkbun-api COMMAND  [general options] [command options]
+	USAGE
+	if [[ "${1:-}" ]] ; then
+		cat <<- USAGE
+		Try '$self --help' for more information.
+		USAGE
+		exit 1
+	fi
+	cat <<-USAGE
+
+	API for Porkbun DNS.
+
+	COMMAND - The operation mode. Possible values:
+	- ping       : Print your external (WAN) IP as seen from the internet
+	- sslcert    : Download SSL certificates for the root domain
+	- dyndns     : Update a DNS A/AAAA record with current (external) IP
+	- raw        : Call an arbitrary API method at ENDPOINT
+
+	SSL download options:
+	    sslcert [CERTIFICATE_PATH] [PRIVATE_KEY_PATH]
+	        Default paths (for this user):
+	        Certificate: $(escape "$PBAPI_SSL_CERTIFICATE_PATH")
+	        Private Key: $(escape "$PBAPI_SSL_PRIVATE_KEY_PATH")
+
+	Raw API options:
+	    raw  ENDPOINT [JSON_DATA]
+
+	General Options:
+	-h|--help     - show this page.
+
+	-v|--verbose
+	   print more details about what is being done. It will also enable debug
+	   messages to <stderr> on all API calls, which might confuse certbot.
+
+	-l|--logfile FILE
+	   Use a different log file. Can also be set by PBAPI_LOG environment variable.
+	   [Default: $logfile]
+
+	-c|--config FILE
+	   Use a different config file. If FILE does not exit it will be created,
+	   with mode 0600. Any required parent directories will also be created,
+	   with mode 0700. Can also be set by PBAPI_CONFIG environment variable.
+	   [Default: $config]
+
+	See the official API documentation at
+	https://porkbun.com/api/json/v3/documentation
+
+	Copyright (C) 2024 Rodrigo Silva (MestreLion) <linux@rodrigosilva.com>
+	License: GPLv3 or later. See <http://www.gnu.org/licenses/gpl.html>
+	USAGE
+	exit 0
+}
+
+
+# Main API functions -----------------------------------------------------------
+
+api() {
+	local path=${1:-}
+	local data=${2:-'{}'}
+	local root=${PBAPI_ROOT#/}
+	local endpoint=${PBAPI_HOST%/}/${root%/}/${path#/}
+	debug "$endpoint" "$data"
+
+	local jq_args; jq_args=(
+		--arg pk "$PBAPI_KEY"
+		--arg sk "$PBAPI_SECRET"
+		--argjson data "$data"
+		'$data + {apikey: $pk, secretapikey: $sk}'
+	)
+	data=$(jq --ascii-output --compact-output --null-input "${jq_args[@]}")
+	res=$(curl_json --data "$data" -- "$endpoint")
+	if [[ -z "$res" ]] || [[ "${res:0:1}" != '{' ]]; then
+		# Blank or most likely 404 HTML page
+		fatal "failed to fetch $endpoint"
+	fi
+	mapfile -t -n 2 arr < <(jq --raw-output '.status,.message' <<< "$res")
+	if [[ "${arr[0]:-}" != SUCCESS ]]; then
+		fatal "API error: ${arr[1]:-}"
+	fi
+	if ((verbose)); then jq <<< "$res" >&2; fi
+	echo "$res"
+}
+
+# API Commands -----------------------------------------------------------------
+
+api_ping() {
+	ip=$(api ping | jq --raw-output ".yourIp")
+	log "$ip"
+	echo "$ip"
+}
+
+api_ssl() {
+	local certfile=${1:-${PBAPI_SSL_CERTIFICATE_PATH:-}}
+	local privfile=${2:-${PBAPI_SSL_PRIVATE_KEY_PATH:-}}
+	certfile=${certfile//@DOMAIN@/${PBAPI_ROOT_DOMAIN}}
+	privfile=${privfile//@DOMAIN@/${PBAPI_ROOT_DOMAIN}}
+	res=$(api ssl/retrieve/"$PBAPI_ROOT_DOMAIN")
+	# shellcheck disable=SC2174
+	mkdir --parents --mode=0700 -- "$(dirname "$certfile")" "$(dirname "$privfile")"
+	install --mode 664 -- <(jq --raw-output '.certificatechain' <<< "$res") "$certfile"
+	message "SSL Certificate saved as: $certfile"
+	install --mode 600 -- <(jq --raw-output '.privatekey'       <<< "$res") "$privfile"
+	message "SSL Private Key saved as: $privfile"
+}
+
+
+# API helper functions ---------------------------------------------------------
+
+fatal()   { echo "$self: $*" >&2; exit 1; }
+message() { if ((verbose)); then echo "$@"; fi; }
+log()     { echo -e "$(date --rfc-3339=seconds)\t$*" >> "$logfile"; }
+debug()   {
+	local endpoint=${1:-}
+	local data=${2:-}
+	local verb=${3:-POST}
+	local msg=("${verb^^}" "$endpoint")
+	if [[ "$data" ]]; then msg+=("'${data}'"); fi
+	message "${msg[@]}" >&2
+}
+get_fields() {
+	local fields=""
+	while (($#)); do fields+=".${1},\"\\t\","; shift; done
+	jq --join-output "${fields:0:-3}n\""
+}
+
+get_data_value() { awk 'BEGIN{RS="[^\\\\]\"data\":\""; FS="\""} NR>1{print $1}'; }
+
+IPv6() { ip -o -6 addr | awk -F'/| +' '$5 == 128 && $7 == "global" {print $4; exit}'; }
+IPv4() { api_ping; }
+
+curl_json() {
+	local curlopts; curlopts=(
+#		--include
+#		--fail        # fail with no output on HTTP status >= 400
+		--silent      # no progress and completely mute...
+		--show-error  # ... except for errors
+		--max-time 30
+		--connect-timeout 10
+		-H "Content-Type: application/json"
+		-H "Accept: application/json"
+	)
+	command curl "${curlopts[@]}" "$@" || fatal "error connecting to ${!#}"
+}
+
+# Input handling helper functions ----------------------------------------------
+
+nonblank(){ [[ "$1" ]] || fatal "$2 is required, check your config and environment"; }
+integer() { nonblank "$1" "${2:-NUM}"; [[ "$1" != *[!0-9]* ]] ||
+            fatal "'$1'${2:+ in $2} is not an integer."; }
+argerr()  { printf "%s: %s\n" "$self" "${1:-error}" >&2 ; usage 1; }
+require() { [[ "$1" ]] || argerr "${2:-a missing value}${3:+ of $3} is required"; }
+invalid() { argerr "invalid argument${2:+ for $2}${1:+: $1}"; }
+intarg()  { require "$1" "${2:-NUM}" "${3-}"; [[ "$1" != *[!0-9]* ]] ||
+            argerr "'$1'${2:+ in $2} is not an integer."; }
+noargs()  { ! (( ${#opts[@]} )) || invalid "${opts[0]}" "command '$cmd'"; }
+escape()  { printf '%q' "$@"; }
+exists()  { type "$@" >/dev/null 2>&1; }
+depends() {
+	local cmd=$1
+	local pkg=${2:-$cmd}
+	local msg='' eol=''
+	if exists "$cmd"; then return; fi
+	if [[ -x /usr/lib/command-not-found ]]; then
+		/usr/lib/command-not-found -- "$cmd" || true
+		eol='\n'
+	else
+		echo "Required command '${cmd}' is not installed." >&2
+		if [[ "$pkg" != '-' ]]; then
+			msg="with:\n\tsudo apt install ${pkg}\n"
+		fi
+	fi
+	echo -e "Please install ${cmd} ${msg}and try again.${eol}" >&2
+	exit 1
+}
+
+# Handle COMMAND setting, preventing it to be set more than once, either by
+# duplicated COMMAND argument or specialized $0 with COMMAND argument, such as
+# `porkbun-dyndns sslcert ...`
+set_cmd() {
+	if ((cmdset)); then
+		argerr "duplicated COMMAND argument, already set as '$cmd': $1"
+	fi
+	cmd=${1,,}
+	cmdset=1
+}
+
+
+# Input handling and validations -----------------------------------------------
+
+# set the factory defaults for usage() and create_config()
+read_env
+
+# Pre-set cmd based on executable filename
+case "$self" in
+	porkbun-certbot) set_cmd sslcert;;
+	porkbun-dyndns)  set_cmd dyndns;;
+esac
+
+# Pre-parse --help
+for arg in "$@"; do [[ "$arg" == "-h" || "$arg" == "--help" ]] && usage; done
+
+# Parse command-line options that cannot override config file settings
+while (($#)); do
+	case "$1" in
+	-v|--verbose   ) verbose=1;;
+	ping           ) set_cmd ping;;
+	sslcert        ) set_cmd sslcert;;
+	dyndns         ) set_cmd dyndns;;
+	raw            ) set_cmd api;;
+	--config=*     )        config="${1#*=}";;
+	-c|--config    ) shift; config="${1:-}";;
+	--logfile=*    )        logfile="${1#*=}";;
+	-l|--logfile   ) shift; logfile="${1:-}";;
+	--) shift; break;;
+	*) if (( cmdset )); then opts+=( "$1" ); else invalid "$1"; fi;;
+	esac
+	shift
+done
+opts+=( $@ )
+
+require "$cmd" COMMAND
+
+require "$config" FILE --config
+[[ -f "$config" ]] || create_config "$config"
+source "$config"
+read_env
+
+nonblank "$PBAPI_ROOT_DOMAIN" PBAPI_ROOT_DOMAIN
+nonblank "$PBAPI_HOST"        PBAPI_HOST
+nonblank "$PBAPI_KEY"         PBAPI_KEY
+nonblank "$PBAPI_SECRET"      PBAPI_SECRET
+integer  "$PBAPI_TTL"         PBAPI_TTL
+
+
+# Command selection and invocation ---------------------------------------------
+
+depends jq
+
+case "$cmd" in
+	api)
+		(( ${#opts[@]} > 2 )) && invalid "${opts[2]}"
+		require "${opts[0]:-}" ENDPOINT "'raw' command"
+		api "${opts[@]}" | jq
+	;;
+	sslcert)
+		(( ${#opts[@]} > 0 )) && require "${opts[0]:-}" CERTIFICATE_PATH "'sslcert' command"
+		(( ${#opts[@]} > 1 )) && require "${opts[1]:-}" PRIVATE_KEY_PATH "'sslcert' command"
+		(( ${#opts[@]} > 2 )) && invalid "${opts[2]}"
+		api_ssl "${opts[@]}"
+	;;
+	ping)   noargs && api_ping;;
+	dyndns) noargs && dyndns;;
+	*) invalid "$cmd" COMMAND;;
+esac
